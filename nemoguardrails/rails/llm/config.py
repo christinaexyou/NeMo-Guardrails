@@ -757,6 +757,27 @@ class ClavataRailConfig(BaseModel):
     )
 
 
+class KServeDetectorConfig(BaseModel):
+    """Configuration for KServe-based detectors."""
+
+    inference_endpoint: str = Field(
+        default="http://localhost:8000/api/v1/texts/contents",
+        description="The endpoint for detector served on KServe.",
+    )
+    model_name: str = Field(
+        default=None,
+        description="The name of the model to use for the detector.",
+    )
+    contents: List[dict] = Field(
+        default=None,
+        description="The messages to use for the detector.",
+    )
+    api_token: str = Field(
+        default=None,
+        description="The API token to use for the detector.",
+    )
+
+
 class RailsConfigData(BaseModel):
     """Configuration data for specific rails that are supported out-of-the-box."""
 
@@ -803,6 +824,11 @@ class RailsConfigData(BaseModel):
     clavata: Optional[ClavataRailConfig] = Field(
         default_factory=ClavataRailConfig,
         description="Configuration for Clavata.",
+    )
+
+    kserve: Optional[KServeDetectorConfig] = Field(
+        default_factory=KServeDetectorConfig,
+        description="Configuration fo detectors served on KServe.",
     )
 
 
