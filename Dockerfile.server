@@ -1,0 +1,104 @@
+FROM registry.access.redhat.com/ubi9/python-312 AS build
+
+# OpenTelemetry build arguments (optional)
+ARG ENABLE_OTEL=false
+ARG OTEL_SERVICE_NAME=guardrails
+ARG OTEL_SERVICE_VERSION=1.0.0
+ARG OTEL_ENVIRONMENT=production
+
+USER 0
+WORKDIR /app
+
+RUN dnf install -y gcc gcc-c++ git && \
+    pip install --no-cache-dir poetry==1.8.2 pyyaml==6.0.2 && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf
+
+COPY pyproject.toml poetry.lock* README.md ./
+COPY nemoguardrails/ ./nemoguardrails/
+COPY examples/ ./examples/
+COPY chat-ui/ ./chat-ui/
+COPY scripts/provider-list.yaml ./scripts/
+COPY scripts/filter_guardrails.py ./scripts/
+COPY scripts/entrypoint.sh ./scripts/
+# Conditionally copy OpenTelemetry entrypoint if enabled
+COPY scripts/otel_entrypoint.py ./scripts/
+RUN chmod +x ./scripts/entrypoint.sh ./scripts/otel_entrypoint.py
+
+ARG GUARDRAILS_PROFILE=opensource
+
+RUN python3 ./scripts/filter_guardrails.py ./scripts/provider-list.yaml $GUARDRAILS_PROFILE
+
+ENV POETRY_VIRTUALENVS_IN_PROJECT=1 \
+    POETRY_NO_INTERACTION=1
+
+
+# Install base dependencies
+RUN poetry install --no-ansi --extras="sdd jailbreak openai nvidia tracing" && \
+    poetry run pip install "spacy>=3.4.4,<4.0.0" && \
+    poetry run python -m spacy download en_core_web_lg
+
+# Conditionally install OpenTelemetry packages if enabled
+RUN if [ "$ENABLE_OTEL" = "true" ]; then \
+        echo "Installing OpenTelemetry packages..." && \
+        poetry run pip install \
+            "opentelemetry-exporter-otlp>=1.20.0" \
+            "opentelemetry-instrumentation-requests>=0.41b0" \
+            "opentelemetry-instrumentation-urllib3lib>=0.41b0" \
+            "opentelemetry-instrumentation-httpx>=0.41b0"; \
+    else \
+        echo "Skipping OpenTelemetry packages (ENABLE_OTEL=$ENABLE_OTEL)"; \
+    fi
+
+FROM registry.access.redhat.com/ubi9/python-312
+
+USER 0
+WORKDIR /app
+
+COPY --from=build /app /app
+RUN rm -f /etc/security/namespace.conf /usr/lib64/security/pam_namespace.so || true && \
+    chgrp -R 0 /app && \
+    chmod -R g+rwX /app
+
+USER 1001
+
+# Pass OpenTelemetry build args to runtime
+ARG ENABLE_OTEL
+ARG OTEL_SERVICE_NAME  
+ARG OTEL_SERVICE_VERSION
+ARG OTEL_ENVIRONMENT
+
+# Base environment
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Conditional OpenTelemetry environment variables
+ENV OTEL_ENABLED=${ENABLE_OTEL:-false} \
+    OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-guardrails} \
+    OTEL_SERVICE_VERSION=${OTEL_SERVICE_VERSION:-1.0.0} \
+    OTEL_RESOURCE_ATTRIBUTES="deployment.environment=${OTEL_ENVIRONMENT:-production}" \
+    OTEL_TRACES_EXPORTER="console,otlp" \
+    OTEL_EXPORTER_OTLP_ENDPOINT="http://jaeger:4317" \
+    OTEL_EXPORTER_OTLP_INSECURE="true" \
+    OTEL_PYTHON_LOG_CORRELATION="true" \
+    OTEL_PYTHON_LOG_LEVEL="info" \
+    OTEL_TRACES_SAMPLER="parentbased_traceidratio" \
+    OTEL_TRACES_SAMPLER_ARG="1.0" \
+    OTEL_PROPAGATORS="tracecontext,baggage,b3multi"
+
+EXPOSE 8000
+
+# Conditional entrypoint based on OpenTelemetry enablement
+RUN if [ "$ENABLE_OTEL" = "true" ]; then \
+        echo '#!/bin/bash' > /app/scripts/conditional_entrypoint.sh && \
+        echo 'echo "🔍 Starting with OpenTelemetry enabled..."' >> /app/scripts/conditional_entrypoint.sh && \
+        echo 'exec python3 /app/scripts/otel_entrypoint.py "$@"' >> /app/scripts/conditional_entrypoint.sh; \
+    else \
+        echo '#!/bin/bash' > /app/scripts/conditional_entrypoint.sh && \
+        echo 'echo "📦 Starting without OpenTelemetry..."' >> /app/scripts/conditional_entrypoint.sh && \
+        echo 'exec /app/scripts/entrypoint.sh "$@"' >> /app/scripts/conditional_entrypoint.sh; \
+    fi && \
+    chmod +x /app/scripts/conditional_entrypoint.sh
+
+ENTRYPOINT ["/app/scripts/conditional_entrypoint.sh"]
