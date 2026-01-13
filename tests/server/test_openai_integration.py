@@ -25,13 +25,20 @@ from nemoguardrails.server import api
 
 @pytest.fixture(scope="function", autouse=True)
 def set_rails_config_path():
-    """Set the rails_config_path to test configs."""
+    """Set the rails_config_path to test configs and required env vars."""
     original_path = api.app.rails_config_path
-    # Use test_configs which have mock LLMs that don't need API keys
+    original_engine = os.environ.get("MAIN_MODEL_ENGINE")
     test_configs_path = os.path.join(os.path.dirname(__file__), "..", "test_configs")
     api.app.rails_config_path = test_configs_path
+    os.environ["MAIN_MODEL_ENGINE"] = "custom_llm"
+    api.llm_rails_instances.clear()
     yield
     api.app.rails_config_path = original_path
+    api.llm_rails_instances.clear()
+    if original_engine is not None:
+        os.environ["MAIN_MODEL_ENGINE"] = original_engine
+    else:
+        os.environ.pop("MAIN_MODEL_ENGINE", None)
 
 
 @pytest.fixture(scope="function")
@@ -66,9 +73,10 @@ def test_openai_client_list_models(openai_client):
 
 def test_openai_client_chat_completion(openai_client):
     response = openai_client.chat.completions.create(
-        model="with_custom_llm",
+        model="gpt-4o",
         messages=[{"role": "user", "content": "hi"}],
         stream=False,
+        extra_body={"guardrails": {"config_id": "with_custom_llm"}},
     )
 
     assert isinstance(response, ChatCompletion)
@@ -93,11 +101,12 @@ def test_openai_client_chat_completion(openai_client):
 
 def test_openai_client_chat_completion_parameterized(openai_client):
     response = openai_client.chat.completions.create(
-        model="with_custom_llm",
+        model="gpt-4o",
         messages=[{"role": "user", "content": "hi"}],
         temperature=0.7,
         max_tokens=100,
         stream=False,
+        extra_body={"guardrails": {"config_id": "with_custom_llm"}},
     )
 
     # Verify response exists
@@ -119,12 +128,12 @@ def test_openai_client_chat_completion_parameterized(openai_client):
 
 def test_openai_client_chat_completion_input_rails(openai_client):
     response = openai_client.chat.completions.create(
-        model="with_input_rails",
+        model="gpt-4o",
         messages=[{"role": "user", "content": "Hello, how are you?"}],
         stream=False,
+        extra_body={"guardrails": {"config_id": "with_input_rails"}},
     )
 
-    # Verify response exists
     assert isinstance(response, ChatCompletion)
     assert response.id is not None
     assert isinstance(response.choices[0], Choice)
@@ -134,28 +143,183 @@ def test_openai_client_chat_completion_input_rails(openai_client):
 @pytest.mark.skip(reason="Should only be run locally as it needs OpenAI key.")
 def test_openai_client_chat_completion_streaming(openai_client):
     stream = openai_client.chat.completions.create(
-        model="input_rails",
+        model="gpt-4o",
         messages=[{"role": "user", "content": "Tell me a short joke."}],
         stream=True,
+        extra_body={"guardrails": {"config_id": "input_rails"}},
     )
 
     chunks = list(stream)
     assert len(chunks) > 0
 
-    # Verify at least one chunk has content
     has_content = any(hasattr(chunk.choices[0].delta, "content") and chunk.choices[0].delta.content for chunk in chunks)
     assert has_content, "At least one chunk should contain content"
 
 
 def test_openai_client_error_handling_invalid_model(openai_client):
     response = openai_client.chat.completions.create(
-        model="nonexistent_config",
+        model="gpt-4o",
         messages=[{"role": "user", "content": "hi"}],
         stream=False,
+        extra_body={"guardrails": {"config_id": "nonexistent_config"}},
     )
 
-    # The error should be in the content
     assert (
         "Could not load" in response.choices[0].message.content
         or "error" in response.choices[0].message.content.lower()
     )
+
+
+def test_openai_client_with_context(openai_client):
+    """Test OpenAI client with context in guardrails."""
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        extra_body={
+            "guardrails": {
+                "config_id": "with_custom_llm",
+                "context": {"user_id": "test123", "session": "abc"},
+            }
+        },
+    )
+
+    assert isinstance(response, ChatCompletion)
+    assert response.id.startswith("chatcmpl-")
+    assert response.object == "chat.completion"
+    assert response.model == "gpt-4o"
+    assert response.choices[0].index == 0
+    assert response.choices[0].finish_reason == "stop"
+    assert response.choices[0].message.role == "assistant"
+    assert response.choices[0].message.content == "Custom LLM response"
+    assert hasattr(response, "config_id")
+    assert response.config_id == "with_custom_llm"
+
+
+def test_openai_client_with_options(openai_client):
+    """Test OpenAI client with custom options in guardrails."""
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        extra_body={
+            "guardrails": {
+                "config_id": "with_custom_llm",
+                "options": {
+                    "rails": {"input": False, "output": False},
+                },
+            }
+        },
+    )
+
+    assert isinstance(response, ChatCompletion)
+    assert response.object == "chat.completion"
+    assert response.model == "gpt-4o"
+    assert response.choices[0].message.content == "Custom LLM response"
+    assert response.config_id == "with_custom_llm"
+
+
+def test_openai_client_with_empty_state(openai_client):
+    """Test OpenAI client with empty state in guardrails."""
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        extra_body={
+            "guardrails": {
+                "config_id": "with_custom_llm",
+                "state": {},
+            }
+        },
+    )
+
+    assert isinstance(response, ChatCompletion)
+    assert response.object == "chat.completion"
+    assert response.model == "gpt-4o"
+    assert response.choices[0].message.content == "Custom LLM response"
+    assert response.config_id == "with_custom_llm"
+
+
+def test_openai_client_with_all_guardrails_fields(openai_client):
+    """Test OpenAI client with all guardrails fields populated."""
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        extra_body={
+            "guardrails": {
+                "config_id": "with_custom_llm",
+                "context": {"user_id": "test123"},
+                "options": {
+                    "rails": {"input": True, "output": True},
+                    "log": {"activated_rails": True},
+                },
+                "state": {},
+            }
+        },
+    )
+
+    assert isinstance(response, ChatCompletion)
+    assert response.object == "chat.completion"
+    assert response.model == "gpt-4o"
+    assert response.choices[0].message.content == "Custom LLM response"
+    assert response.config_id == "with_custom_llm"
+
+    assert hasattr(response, "log")
+    assert response.log is not None
+    assert "activated_rails" in response.log
+    assert isinstance(response.log["activated_rails"], list)
+    assert "stats" in response.log
+    assert isinstance(response.log["stats"], dict)
+    assert "total_duration" in response.log["stats"]
+
+
+def test_openai_client_with_multiple_configs(openai_client):
+    """Test OpenAI client with multiple config_ids."""
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        extra_body={
+            "guardrails": {
+                "config_ids": ["with_custom_llm"],
+            }
+        },
+    )
+
+    assert isinstance(response, ChatCompletion)
+    assert response.object == "chat.completion"
+    assert response.model == "gpt-4o"
+    assert response.choices[0].message.content == "Custom LLM response"
+    assert response.config_id == "with_custom_llm"
+
+
+def test_openai_client_with_rails_disabled(openai_client):
+    """Test OpenAI client with all rails disabled.
+
+    When dialog rails are disabled, the LLM is called directly without going
+    through the dialog flow, resulting in the user message being echoed back.
+    """
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        extra_body={
+            "guardrails": {
+                "config_id": "with_custom_llm",
+                "options": {
+                    "rails": {
+                        "input": False,
+                        "output": False,
+                        "dialog": False,
+                    },
+                },
+            }
+        },
+    )
+
+    assert isinstance(response, ChatCompletion)
+    assert response.object == "chat.completion"
+    assert response.model == "gpt-4o"
+    assert response.choices[0].message.content == "hi"
+    assert response.config_id == "with_custom_llm"

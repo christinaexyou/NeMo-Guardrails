@@ -14,6 +14,7 @@
 # limitations under the License.
 import os
 
+import pytest
 from fastapi.testclient import TestClient
 
 from nemoguardrails.server import api
@@ -21,18 +22,34 @@ from nemoguardrails.server import api
 client = TestClient(api.app)
 
 
+@pytest.fixture(scope="function", autouse=True)
+def setup_test_env():
+    original_engine = os.environ.get("MAIN_MODEL_ENGINE")
+    os.environ["MAIN_MODEL_ENGINE"] = "custom_llm"
+    api.llm_rails_instances.clear()
+    yield
+    api.llm_rails_instances.clear()
+    if original_engine is not None:
+        os.environ["MAIN_MODEL_ENGINE"] = original_engine
+    else:
+        os.environ.pop("MAIN_MODEL_ENGINE", None)
+
+
 def _test_call(config_id):
     response = client.post(
         "/v1/chat/completions",
         json={
-            "config_id": config_id,
+            "model": "gpt-4o",
             "messages": [
                 {
                     "content": "hi",
                     "role": "user",
                 }
             ],
-            "state": {},
+            "guardrails": {
+                "config_id": config_id,
+                "state": {},
+            },
         },
     )
     assert response.status_code == 200
@@ -42,21 +59,20 @@ def _test_call(config_id):
     assert res["choices"][0]["message"]["content"] == "Hello!"
     assert res.get("state")
 
-    # When making a second call with the returned state, the conversations should continue
-    # and we should get the "Hello again!" message.
-    # For Colang 2.x, we only send the new user message, not the conversation history
-    # since the state maintains the conversation context.
     response = client.post(
         "/v1/chat/completions",
         json={
-            "config_id": config_id,
+            "model": "gpt-4o",
             "messages": [
                 {
                     "content": "hi",
                     "role": "user",
                 }
             ],
-            "state": res["state"],
+            "guardrails": {
+                "config_id": config_id,
+                "state": res["state"],
+            },
         },
     )
     res = response.json()
