@@ -16,7 +16,6 @@
 """LLM Rails entry point."""
 
 import asyncio
-import importlib.util
 import json
 import logging
 import os
@@ -51,8 +50,7 @@ from nemoguardrails.actions.llm.utils import (
 )
 from nemoguardrails.actions.output_mapping import is_output_blocked
 from nemoguardrails.actions.v2_x.generation import LLMGenerationActionsV2dotx
-from nemoguardrails.colang import parse_colang_file
-from nemoguardrails.colang.v1_0.runtime.flows import _normalize_flow_id, compute_context
+from nemoguardrails.colang.v1_0.runtime.flows import compute_context
 from nemoguardrails.colang.v1_0.runtime.runtime import Runtime, RuntimeV1_0
 from nemoguardrails.colang.v2_x.runtime.flows import Action, State
 from nemoguardrails.colang.v2_x.runtime.runtime import RuntimeV2_x
@@ -92,6 +90,7 @@ from nemoguardrails.rails.llm.config import (
     OutputRailsStreamingConfig,
     RailsConfig,
 )
+from nemoguardrails.rails.llm.config_loader import ConfigLoader
 from nemoguardrails.rails.llm.options import (
     GenerationLog,
     GenerationOptions,
@@ -156,76 +155,8 @@ class LLMRails:
         #   should be removed
         self.events_history_cache = {}
 
-        # We also load the default flows from the `default_flows.yml` file in the current folder.
-        # But only for version 1.0.
-        # TODO: decide on the default flows for 2.x.
-        if config.colang_version == "1.0":
-            # We also load the default flows from the `llm_flows.co` file in the current folder.
-            current_folder = os.path.dirname(__file__)
-            default_flows_file = "llm_flows.co"
-            default_flows_path = os.path.join(current_folder, default_flows_file)
-            with open(default_flows_path, "r") as f:
-                default_flows_content = f.read()
-                default_flows = parse_colang_file(default_flows_file, default_flows_content)["flows"]
-
-            # We mark all the default flows as system flows.
-            for flow_config in default_flows:
-                flow_config["is_system_flow"] = True
-
-            # We add the default flows to the config.
-            self.config.flows.extend(default_flows)
-
-            # We also need to load the content from the components library.
-            library_path = os.path.join(os.path.dirname(__file__), "../../library")
-            for root, dirs, files in os.walk(library_path):
-                for file in files:
-                    # Extract the full path for the file
-                    full_path = os.path.join(root, file)
-                    if file.endswith(".co"):
-                        log.debug(f"Loading file: {full_path}")
-                        with open(full_path, "r", encoding="utf-8") as f:
-                            content = parse_colang_file(file, content=f.read(), version=config.colang_version)
-                            if not content:
-                                continue
-
-                        # We mark all the flows coming from the guardrails library as system flows.
-                        for flow_config in content["flows"]:
-                            flow_config["is_system_flow"] = True
-
-                        # We load all the flows
-                        self.config.flows.extend(content["flows"])
-
-                        # And all the messages as well, if they have not been overwritten
-                        for message_id, utterances in content.get("bot_messages", {}).items():
-                            if message_id not in self.config.bot_messages:
-                                self.config.bot_messages[message_id] = utterances
-
-        # Last but not least, we mark all the flows that are used in any of the rails
-        # as system flows (so they don't end up in the prompt).
-
-        rail_flow_ids = config.rails.input.flows + config.rails.output.flows + config.rails.retrieval.flows
-
-        for flow_config in self.config.flows:
-            if flow_config.get("id") in rail_flow_ids:
-                flow_config["is_system_flow"] = True
-
-                # We also mark them as subflows by default, to simplify the syntax
-                flow_config["is_subflow"] = True
-
-        # We check if the configuration or any of the imported ones have config.py modules.
-        config_modules = []
-        for _path in list(self.config.imported_paths.values() if self.config.imported_paths else []) + [
-            self.config.config_path
-        ]:
-            if _path:
-                filepath = os.path.join(_path, "config.py")
-                if os.path.exists(filepath):
-                    filename = os.path.basename(filepath)
-                    spec = importlib.util.spec_from_file_location(filename, filepath)
-                    if spec and spec.loader:
-                        config_module = importlib.util.module_from_spec(spec)
-                        spec.loader.exec_module(config_module)
-                        config_modules.append(config_module)
+        # Load config with default flows and library content
+        config_modules = ConfigLoader().load_config(config)
 
         colang_version_to_runtime: Dict[str, Type[Runtime]] = {
             "1.0": RuntimeV1_0,
@@ -264,7 +195,7 @@ class LLMRails:
             self._log_adapters = None
 
         # We run some additional checks on the config
-        self._validate_config()
+        ConfigLoader._validate_config(self.config)
 
         # Next, we initialize the LLM engines (main engine and action engines if specified).
         self._init_llms()
@@ -310,36 +241,6 @@ class LLMRails:
         self.llm = llm
         self.llm_generation_actions.llm = llm
         self.runtime.register_action_param("llm", llm)
-
-    def _validate_config(self):
-        """Runs additional validation checks on the config."""
-
-        if self.config.colang_version == "1.0":
-            existing_flows_names = set([flow.get("id") for flow in self.config.flows])
-        else:
-            existing_flows_names = set([flow.get("name") for flow in self.config.flows])
-
-        for flow_name in self.config.rails.input.flows:
-            # content safety check input/output flows are special as they have parameters
-            flow_name = _normalize_flow_id(flow_name)
-            if flow_name not in existing_flows_names:
-                raise InvalidRailsConfigurationError(f"The provided input rail flow `{flow_name}` does not exist")
-
-        for flow_name in self.config.rails.output.flows:
-            flow_name = _normalize_flow_id(flow_name)
-            if flow_name not in existing_flows_names:
-                raise InvalidRailsConfigurationError(f"The provided output rail flow `{flow_name}` does not exist")
-
-        for flow_name in self.config.rails.retrieval.flows:
-            if flow_name not in existing_flows_names:
-                raise InvalidRailsConfigurationError(f"The provided retrieval rail flow `{flow_name}` does not exist")
-
-        # If both passthrough mode and single call mode are specified, we raise an exception.
-        if self.config.passthrough and self.config.rails.dialog.single_call.enabled:
-            raise InvalidRailsConfigurationError(
-                "The passthrough mode and the single call dialog rails mode can't be used at the same time. "
-                "The single call mode needs to use an altered prompt when prompting the LLM. "
-            )
 
     async def _init_kb(self):
         """Initializes the knowledge base."""
