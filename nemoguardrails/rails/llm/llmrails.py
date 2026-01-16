@@ -75,7 +75,6 @@ from nemoguardrails.exceptions import (
     InvalidRailsConfigurationError,
     StreamingNotSupportedError,
 )
-from nemoguardrails.kb.kb import KnowledgeBase
 from nemoguardrails.llm.cache import CacheInterface, LFUCache
 from nemoguardrails.llm.models.initializer import (
     ModelInitializationError,
@@ -92,6 +91,7 @@ from nemoguardrails.rails.llm.config import (
     OutputRailsStreamingConfig,
     RailsConfig,
 )
+from nemoguardrails.rails.llm.kb_builder import KnowledgeBaseBuilder
 from nemoguardrails.rails.llm.options import (
     GenerationLog,
     GenerationOptions,
@@ -287,16 +287,18 @@ class LLMRails:
         # Next, we initialize the Knowledge Base
         # There are still some edge cases not covered by nest_asyncio.
         # Using a separate thread always for now.
+        self.kb_builder = KnowledgeBaseBuilder(self.config, self._get_embeddings_search_provider_instance)
+
         loop = get_or_create_event_loop()
         if True or check_sync_call_from_async_loop():
-            t = threading.Thread(target=asyncio.run, args=(self._init_kb(),))
+            t = threading.Thread(target=asyncio.run, args=(self.kb_builder.build(),))
             t.start()
             t.join()
         else:
-            loop.run_until_complete(self._init_kb())
+            loop.run_until_complete(self.kb_builder.build())
 
         # We also register the kb as a parameter that can be passed to actions.
-        self.runtime.register_action_param("kb", self.kb)
+        self.runtime.register_action_param("kb", self.kb_builder.get_kb())
 
         # Reference to the general ExplainInfo object.
         self.explain_info = None
@@ -340,22 +342,6 @@ class LLMRails:
                 "The passthrough mode and the single call dialog rails mode can't be used at the same time. "
                 "The single call mode needs to use an altered prompt when prompting the LLM. "
             )
-
-    async def _init_kb(self):
-        """Initializes the knowledge base."""
-        self.kb = None
-
-        if not self.config.docs:
-            return
-
-        documents = [doc.content for doc in self.config.docs]
-        self.kb = KnowledgeBase(
-            documents=documents,
-            config=self.config.knowledge_base,
-            get_embedding_search_provider_instance=self._get_embeddings_search_provider_instance,
-        )
-        self.kb.init()
-        await self.kb.build()
 
     def _prepare_model_kwargs(self, model_config):
         """
