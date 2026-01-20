@@ -641,7 +641,7 @@ def llm_config_with_main():
 
 @pytest.mark.asyncio
 @patch(
-    "nemoguardrails.rails.llm.llmrails.init_llm_model",
+    "nemoguardrails.rails.llm.model_factory.init_llm_model",
     return_value=FakeLLM(responses=["this should not be used"]),
 )
 async def test_llm_config_precedence(mock_init, llm_config_with_main):
@@ -656,7 +656,7 @@ async def test_llm_config_precedence(mock_init, llm_config_with_main):
 
 @pytest.mark.asyncio
 @patch(
-    "nemoguardrails.rails.llm.llmrails.init_llm_model",
+    "nemoguardrails.rails.llm.model_factory.init_llm_model",
     return_value=FakeLLM(responses=["this should not be used"]),
 )
 async def test_llm_config_warning(mock_init, llm_config_with_main, caplog):
@@ -705,7 +705,7 @@ def llm_config_with_multiple_models():
 
 @pytest.mark.asyncio
 @patch(
-    "nemoguardrails.rails.llm.llmrails.init_llm_model",
+    "nemoguardrails.rails.llm.model_factory.init_llm_model",
     return_value=FakeLLM(responses=["content safety response"]),
 )
 async def test_other_models_honored(mock_init, llm_config_with_multiple_models):
@@ -756,7 +756,7 @@ async def test_llm_constructor_with_empty_models_config():
 
 @pytest.mark.asyncio
 @patch(
-    "nemoguardrails.rails.llm.llmrails.init_llm_model",
+    "nemoguardrails.rails.llm.model_factory.init_llm_model",
     return_value=FakeLLM(responses=["safe"]),
 )
 async def test_main_llm_from_config_registered_as_action_param(mock_init, llm_config_with_main):
@@ -811,7 +811,7 @@ async def test_main_llm_from_config_registered_as_action_param(mock_init, llm_co
     assert action_finished_event["return_value"] == "llm_action_success"
 
 
-@patch("nemoguardrails.rails.llm.llmrails.init_llm_model")
+@patch("nemoguardrails.rails.llm.model_factory.init_llm_model")
 @patch.dict(os.environ, {"TEST_OPENAI_KEY": "secret-api-key-from-env"})
 def test_api_key_environment_variable_passed_to_init_llm_model(mock_init_llm_model):
     """Test that API keys from environment variables are passed to init_llm_model."""
@@ -845,7 +845,7 @@ def test_api_key_environment_variable_passed_to_init_llm_model(mock_init_llm_mod
     assert call_args.kwargs["mode"] == "chat"
 
 
-@patch("nemoguardrails.rails.llm.llmrails.init_llm_model")
+@patch("nemoguardrails.rails.llm.model_factory.init_llm_model")
 @patch.dict(os.environ, {"CONTENT_SAFETY_KEY": "safety-key-from-env"})
 def test_api_key_environment_variable_for_non_main_models(mock_init_llm_model):
     """Test that API keys from environment variables work for non-main models too.
@@ -887,7 +887,7 @@ def test_api_key_environment_variable_for_non_main_models(mock_init_llm_model):
     assert safety_call_args.kwargs["kwargs"]["temperature"] == 0.0
 
 
-@patch("nemoguardrails.rails.llm.llmrails.init_llm_model")
+@patch("nemoguardrails.rails.llm.model_factory.init_llm_model")
 def test_missing_api_key_environment_variable_graceful_handling(mock_init_llm_model):
     """Test that missing environment variables are handled gracefully during LLM initialization.
 
@@ -928,6 +928,7 @@ def test_api_key_environment_variable_logic_without_rails_init():
     """
     config = RailsConfig(models=[Model(type="main", engine="fake", model="fake")])
     rails = LLMRails(config=config, llm=FakeLLM(responses=[]))
+    model_factory = rails.model_factory
 
     # case 1: env var exists
     class ModelWithEnvVar:
@@ -937,7 +938,7 @@ def test_api_key_environment_variable_logic_without_rails_init():
 
     with patch.dict(os.environ, {"MY_API_KEY": "my-secret-key"}):
         model = ModelWithEnvVar()
-        kwargs = rails._prepare_model_kwargs(model)
+        kwargs = model_factory._prepare_model_kwargs(model)
 
         assert kwargs["api_key"] == "my-secret-key"
         assert kwargs["temperature"] == 0.8
@@ -945,7 +946,7 @@ def test_api_key_environment_variable_logic_without_rails_init():
     # case 2: env var doesn't exist
     with patch.dict(os.environ, {}, clear=True):
         model = ModelWithEnvVar()
-        kwargs = rails._prepare_model_kwargs(model)
+        kwargs = model_factory._prepare_model_kwargs(model)
 
         assert "api_key" not in kwargs
         assert kwargs["temperature"] == 0.8
@@ -957,14 +958,14 @@ def test_api_key_environment_variable_logic_without_rails_init():
             self.parameters = {"api_key": "direct-key", "temperature": 0.3}
 
     model = ModelWithoutEnvVar()
-    kwargs = rails._prepare_model_kwargs(model)
+    kwargs = model_factory._prepare_model_kwargs(model)
 
     assert kwargs["api_key"] == "direct-key"
     assert kwargs["temperature"] == 0.3
 
 
 @pytest.mark.asyncio
-@patch("nemoguardrails.rails.llm.llmrails.init_llm_model")
+@patch("nemoguardrails.rails.llm.model_factory.init_llm_model")
 async def test_stream_usage_always_enabled(mock_init_llm_model):
     """Test that stream_usage=True is always set for LLM models."""
     config = RailsConfig.from_content(
@@ -1095,7 +1096,7 @@ def test_explain_calls_ensure_explain_info():
     assert rails.explain_info == ExplainInfo()
 
 
-@patch("nemoguardrails.rails.llm.llmrails.init_llm_model")
+@patch("nemoguardrails.rails.llm.model_factory.init_llm_model")
 def test_cache_initialization_disabled_by_default(mock_init_llm_model):
     mock_llm = FakeLLM(responses=["response"])
     mock_init_llm_model.return_value = mock_llm
@@ -1121,7 +1122,7 @@ def test_cache_initialization_disabled_by_default(mock_init_llm_model):
     assert model_caches is None or len(model_caches) == 0
 
 
-@patch("nemoguardrails.rails.llm.llmrails.init_llm_model")
+@patch("nemoguardrails.rails.llm.model_factory.init_llm_model")
 def test_cache_initialization_with_enabled_cache(mock_init_llm_model):
     from nemoguardrails.rails.llm.config import CacheStatsConfig, ModelCacheConfig
 
@@ -1156,7 +1157,7 @@ def test_cache_initialization_with_enabled_cache(mock_init_llm_model):
     assert model_caches["content_safety"].maxsize == 1000
 
 
-@patch("nemoguardrails.rails.llm.llmrails.init_llm_model")
+@patch("nemoguardrails.rails.llm.model_factory.init_llm_model")
 def test_cache_not_created_for_main_and_embeddings_models(mock_init_llm_model):
     from nemoguardrails.rails.llm.config import ModelCacheConfig
 
@@ -1187,7 +1188,7 @@ def test_cache_not_created_for_main_and_embeddings_models(mock_init_llm_model):
     assert "embeddings" not in model_caches
 
 
-@patch("nemoguardrails.rails.llm.llmrails.init_llm_model")
+@patch("nemoguardrails.rails.llm.model_factory.init_llm_model")
 def test_cache_initialization_with_zero_maxsize_raises_error(mock_init_llm_model):
     from nemoguardrails.rails.llm.config import ModelCacheConfig
 
@@ -1209,7 +1210,7 @@ def test_cache_initialization_with_zero_maxsize_raises_error(mock_init_llm_model
         LLMRails(config=config, verbose=False)
 
 
-@patch("nemoguardrails.rails.llm.llmrails.init_llm_model")
+@patch("nemoguardrails.rails.llm.model_factory.init_llm_model")
 def test_cache_initialization_with_stats_enabled(mock_init_llm_model):
     from nemoguardrails.rails.llm.config import CacheStatsConfig, ModelCacheConfig
 
@@ -1241,7 +1242,7 @@ def test_cache_initialization_with_stats_enabled(mock_init_llm_model):
     assert cache.supports_stats_logging() is True
 
 
-@patch("nemoguardrails.rails.llm.llmrails.init_llm_model")
+@patch("nemoguardrails.rails.llm.model_factory.init_llm_model")
 def test_cache_initialization_with_multiple_models(mock_init_llm_model):
     from nemoguardrails.rails.llm.config import ModelCacheConfig
 

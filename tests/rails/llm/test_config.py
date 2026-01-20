@@ -310,6 +310,6 @@ def test_llm_rails_configure_streaming_with_attr():
 
     rails = LLMRails(config, llm=mock_llm)
     setattr(mock_llm, "streaming", None)
-    rails._configure_main_llm_streaming(llm=mock_llm)
+    rails.model_factory._configure_main_llm_streaming(llm=mock_llm)
 
     assert mock_llm.streaming
