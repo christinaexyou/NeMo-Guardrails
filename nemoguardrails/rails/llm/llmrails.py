@@ -1014,9 +1014,10 @@ class LLMRails:
             # print("Closing the stream handler explicitly")
             await streaming_handler.push_chunk(END_OF_STREAM)  # type: ignore
 
-        # IF tracing is enabled we need to set GenerationLog attrs
+        # If tracing or metrics are enabled we need GenerationLog data
+        _observability_enabled = self.config.tracing.enabled or self.config.metrics.enabled
         original_log_options = None
-        if self.config.tracing.enabled:
+        if _observability_enabled:
             if gen_options is None:
                 gen_options = GenerationOptions()
             else:
@@ -1135,7 +1136,6 @@ class LLMRails:
 
                 span_format = getattr(self.config.tracing, "span_format", "opentelemetry")
                 enable_content_capture = getattr(self.config.tracing, "enable_content_capture", False)
-                # Create a Tracer instance with instantiated adapters and span configuration
                 tracer = Tracer(
                     input=messages,
                     response=res,
@@ -1145,26 +1145,29 @@ class LLMRails:
                 )
                 await tracer.export_async()
 
-                # respect original log specification, if tracing added information to the output
-                if original_log_options:
-                    if not any(
-                        (
-                            original_log_options.internal_events,
-                            original_log_options.activated_rails,
-                            original_log_options.llm_calls,
-                            original_log_options.colang_history,
-                        )
-                    ):
-                        res.log = None
-                    else:
-                        # Ensure res.log exists before setting attributes
-                        if res.log is not None:
-                            if not original_log_options.internal_events:
-                                res.log.internal_events = []
-                            if not original_log_options.activated_rails:
-                                res.log.activated_rails = []
-                            if not original_log_options.llm_calls:
-                                res.log.llm_calls = []
+            if self.config.metrics.enabled and res.log is not None:
+                from nemoguardrails.metrics.instruments import record_generation_log_metrics
+
+                record_generation_log_metrics(res.log, self.config.metrics.config_id)
+
+            if _observability_enabled and original_log_options:
+                if not any(
+                    (
+                        original_log_options.internal_events,
+                        original_log_options.activated_rails,
+                        original_log_options.llm_calls,
+                        original_log_options.colang_history,
+                    )
+                ):
+                    res.log = None
+                else:
+                    if res.log is not None:
+                        if not original_log_options.internal_events:
+                            res.log.internal_events = []
+                        if not original_log_options.activated_rails:
+                            res.log.activated_rails = []
+                        if not original_log_options.llm_calls:
+                            res.log.llm_calls = []
 
             return res
         else:

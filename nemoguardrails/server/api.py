@@ -35,6 +35,7 @@ from starlette.responses import StreamingResponse
 from starlette.staticfiles import StaticFiles
 
 from nemoguardrails import LLMRails, RailsConfig, utils
+from nemoguardrails.metrics.server import record_config_load, track_request
 from nemoguardrails.rails.llm.config import Model
 from nemoguardrails.rails.llm.options import GenerationResponse
 from nemoguardrails.server.datastore.datastore import DataStore
@@ -362,6 +363,7 @@ async def _get_rails(config_ids: List[str], model_name: Optional[str] = None) ->
 
     llm_rails = LLMRails(config=full_llm_rails_config, verbose=True)
     llm_rails_instances[configs_cache_key] = llm_rails
+    record_config_load(configs_cache_key)
 
     # If we have a cache for the events, we restore it
     llm_rails.events_history_cache = llm_rails_events_history_cache.get(configs_cache_key, {})
@@ -487,124 +489,127 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
             config_id=config_ids[0] if config_ids else None,
         )
 
-    try:
-        messages = body.messages or []
-        if body.guardrails.context:
-            messages.insert(0, {"role": "context", "content": body.guardrails.context})
+    config_id = config_ids[0] if config_ids else "unknown"
 
-        # If we have a `thread_id` specified, we need to look up the thread
-        datastore_key = None
+    with track_request(config_id=config_id, streaming=bool(body.stream)) as tracker:
+        try:
+            messages = body.messages or []
+            if body.guardrails.context:
+                messages.insert(0, {"role": "context", "content": body.guardrails.context})
 
-        if body.guardrails.thread_id:
-            if datastore is None:
-                raise RuntimeError("No DataStore has been configured.")
-            # We make sure the `thread_id` meets the minimum complexity requirement.
-            if len(body.guardrails.thread_id) < 16:
-                return create_error_chat_completion(
-                    model=body.model,
-                    error_message="The `thread_id` must have a minimum length of 16 characters.",
-                    config_id=config_ids[0] if config_ids else None,
+            # If we have a `thread_id` specified, we need to look up the thread
+            datastore_key = None
+
+            if body.guardrails.thread_id:
+                if datastore is None:
+                    raise RuntimeError("No DataStore has been configured.")
+                # We make sure the `thread_id` meets the minimum complexity requirement.
+                if len(body.guardrails.thread_id) < 16:
+                    return create_error_chat_completion(
+                        model=body.model,
+                        error_message="The `thread_id` must have a minimum length of 16 characters.",
+                        config_id=config_id,
+                    )
+
+                # Fetch the existing thread messages. For easier management, we prepend
+                # the string `thread-` to all thread keys.
+                datastore_key = "thread-" + body.guardrails.thread_id
+                thread_messages = json.loads(await datastore.get(datastore_key) or "[]")
+
+                # And prepend them.
+                messages = thread_messages + messages
+
+            generation_options = body.guardrails.options
+
+            # Validate state format if provided
+            if body.guardrails.state is not None and body.guardrails.state != {}:
+                if "events" not in body.guardrails.state and "state" not in body.guardrails.state:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Invalid state format: state must contain 'events' or 'state' key. Use an empty dict {} to start a new conversation.",
+                    )
+
+            # Initialize llm_params if not already set
+            if generation_options.llm_params is None:
+                generation_options.llm_params = {}
+
+            # Set OpenAI-compatible parameters in llm_params
+            if body.max_tokens:
+                generation_options.llm_params["max_tokens"] = body.max_tokens
+            if body.temperature is not None:
+                generation_options.llm_params["temperature"] = body.temperature
+            if body.top_p is not None:
+                generation_options.llm_params["top_p"] = body.top_p
+            if body.stop:
+                generation_options.llm_params["stop"] = body.stop
+            if body.presence_penalty is not None:
+                generation_options.llm_params["presence_penalty"] = body.presence_penalty
+            if body.frequency_penalty is not None:
+                generation_options.llm_params["frequency_penalty"] = body.frequency_penalty
+
+            if body.stream:
+                # Use stream_async for streaming with output rails support
+                stream_iterator = llm_rails.stream_async(
+                    messages=messages,
+                    options=generation_options,
+                    state=body.guardrails.state,
                 )
 
-            # Fetch the existing thread messages. For easier management, we prepend
-            # the string `thread-` to all thread keys.
-            datastore_key = "thread-" + body.guardrails.thread_id
-            thread_messages = json.loads(await datastore.get(datastore_key) or "[]")
-
-            # And prepend them.
-            messages = thread_messages + messages
-
-        generation_options = body.guardrails.options
-
-        # Validate state format if provided
-        if body.guardrails.state is not None and body.guardrails.state != {}:
-            if "events" not in body.guardrails.state and "state" not in body.guardrails.state:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Invalid state format: state must contain 'events' or 'state' key. Use an empty dict {} to start a new conversation.",
-                )
-
-        # Initialize llm_params if not already set
-        if generation_options.llm_params is None:
-            generation_options.llm_params = {}
-
-        # Set OpenAI-compatible parameters in llm_params
-        if body.max_tokens:
-            generation_options.llm_params["max_tokens"] = body.max_tokens
-        if body.temperature is not None:
-            generation_options.llm_params["temperature"] = body.temperature
-        if body.top_p is not None:
-            generation_options.llm_params["top_p"] = body.top_p
-        if body.stop:
-            generation_options.llm_params["stop"] = body.stop
-        if body.presence_penalty is not None:
-            generation_options.llm_params["presence_penalty"] = body.presence_penalty
-        if body.frequency_penalty is not None:
-            generation_options.llm_params["frequency_penalty"] = body.frequency_penalty
-
-        if body.stream:
-            # Use stream_async for streaming with output rails support
-            stream_iterator = llm_rails.stream_async(
-                messages=messages,
-                options=generation_options,
-                state=body.guardrails.state,
-            )
-
-            return StreamingResponse(
-                _format_streaming_response(stream_iterator, model_name=body.model),
-                media_type="text/event-stream",
-            )
-        else:
-            res = await llm_rails.generate_async(
-                messages=messages,
-                options=generation_options,
-                state=body.guardrails.state,
-            )
-
-            # Extract bot message for thread storage if needed
-            bot_message = extract_bot_message_from_response(res)
-
-            # If we're using threads, we also need to update the data before returning
-            # the message.
-            if body.guardrails.thread_id and datastore is not None and datastore_key is not None:
-                await datastore.set(datastore_key, json.dumps(messages + [bot_message]))
-
-            # Build the response with OpenAI-compatible format using utility function
-            if isinstance(res, GenerationResponse):
-                return generation_response_to_chat_completion(
-                    response=res,
-                    model=body.model,
-                    config_id=config_ids[0] if config_ids else None,
+                return StreamingResponse(
+                    _format_streaming_response(stream_iterator, model_name=body.model),
+                    media_type="text/event-stream",
                 )
             else:
-                # For dict responses, convert to basic chat completion
-                return GuardrailsChatCompletion(
-                    id=f"chatcmpl-{uuid.uuid4()}",
-                    object="chat.completion",
-                    created=int(time.time()),
-                    model=body.model,
-                    choices=[
-                        Choice(
-                            index=0,
-                            message=ChatCompletionMessage(
-                                role="assistant",
-                                content=bot_message.get("content", ""),
-                            ),
-                            finish_reason="stop",
-                            logprobs=None,
-                        )
-                    ],
+                res = await llm_rails.generate_async(
+                    messages=messages,
+                    options=generation_options,
+                    state=body.guardrails.state,
                 )
 
-    except HTTPException:
-        raise
-    except Exception as ex:
-        log.exception(ex)
-        return create_error_chat_completion(
-            model=body.model,
-            error_message="Internal server error",
-            config_id=config_ids[0] if config_ids else None,
-        )
+                # Extract bot message for thread storage if needed
+                bot_message = extract_bot_message_from_response(res)
+
+                # If we're using threads, we also need to update the data before returning
+                # the message.
+                if body.guardrails.thread_id and datastore is not None and datastore_key is not None:
+                    await datastore.set(datastore_key, json.dumps(messages + [bot_message]))
+
+                if isinstance(res, GenerationResponse):
+                    return generation_response_to_chat_completion(
+                        response=res,
+                        model=body.model,
+                        config_id=config_id,
+                    )
+                else:
+                    # For dict responses, convert to basic chat completion
+                    return GuardrailsChatCompletion(
+                        id=f"chatcmpl-{uuid.uuid4()}",
+                        object="chat.completion",
+                        created=int(time.time()),
+                        model=body.model,
+                        choices=[
+                            Choice(
+                                index=0,
+                                message=ChatCompletionMessage(
+                                    role="assistant",
+                                    content=bot_message.get("content", ""),
+                                ),
+                                finish_reason="stop",
+                                logprobs=None,
+                            )
+                        ],
+                    )
+
+        except HTTPException:
+            raise
+        except Exception as ex:
+            tracker.set_status("error")
+            log.exception(ex)
+            return create_error_chat_completion(
+                model=body.model,
+                error_message="Internal server error",
+                config_id=config_id,
+            )
 
 
 # By default, there are no challenges
