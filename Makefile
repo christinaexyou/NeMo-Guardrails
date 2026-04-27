@@ -6,6 +6,15 @@ all: help
 # Define a variable for the test file path.
 TEST_FILE ?= tests/
 
+PLATFORM ?= linux/amd64,linux/arm64
+IMAGE_REPO ?= quay.io/christinaexyou/nemo-guardrails-server:otel-sdk
+
+docker-build:
+	docker buildx build --platform ${PLATFORM} -t ${IMAGE_REPO} -f Dockerfile.server .
+
+docker-push:
+	docker push ${IMAGE_REPO}
+
 test:
 	poetry run pytest $(TEST_FILE)
 

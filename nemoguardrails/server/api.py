@@ -37,6 +37,7 @@ from starlette.responses import StreamingResponse
 from starlette.staticfiles import StaticFiles
 
 from nemoguardrails import LLMRails, RailsConfig, utils
+from nemoguardrails.guardrails.telemetry import request_metrics
 from nemoguardrails.rails.llm.config import Model
 from nemoguardrails.rails.llm.options import (
     ActivatedRail,
@@ -52,8 +53,8 @@ from nemoguardrails.server.schemas.openai import (
     GuardrailCheckResponse,
     GuardrailsChatCompletion,
     GuardrailsChatCompletionRequest,
-    OpenAIModelsList,
     MessageCheckResult,
+    OpenAIModelsList,
     RailStatus,
 )
 from nemoguardrails.server.schemas.utils import (
@@ -113,9 +114,9 @@ async def lifespan(app: GuardrailsApp):
 
     # If there is a `config.yml` in the root `app.rails_config_path`, then
     # that means we are in single config mode.
-    if os.path.exists(os.path.join(app.rails_config_path, "config.yml")) or os.path.exists(
-        os.path.join(app.rails_config_path, "config.yaml")
-    ):
+    if os.path.exists(
+        os.path.join(app.rails_config_path, "config.yml")
+    ) or os.path.exists(os.path.join(app.rails_config_path, "config.yaml")):
         app.single_config_mode = True
         app.single_config_id = os.path.basename(app.rails_config_path)
     else:
@@ -195,6 +196,17 @@ if ENABLE_CORS:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+_METERED_PATHS = frozenset({"/v1/chat/completions", "/v1/guardrail/checks"})
+
+
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    if request.url.path in _METERED_PATHS:
+        with request_metrics():
+            return await call_next(request)
+    return await call_next(request)
+
 
 app.default_config_id = None
 
@@ -315,7 +327,9 @@ def _update_models_in_config(config: RailsConfig, main_model: Model) -> RailsCon
     return config.model_copy(update={"models": models})
 
 
-async def _get_rails(config_ids: List[str], model_name: Optional[str] = None) -> LLMRails:
+async def _get_rails(
+    config_ids: List[str], model_name: Optional[str] = None
+) -> LLMRails:
     """Returns the rails instance for the given config id and model.
 
     Args:
@@ -361,28 +375,38 @@ async def _get_rails(config_ids: List[str], model_name: Optional[str] = None) ->
 
     if model_name:
         # Get engine from environment or use existing main model's engine
-        existing_main_model = next((m for m in full_llm_rails_config.models if m.type == "main"), None)
+        existing_main_model = next(
+            (m for m in full_llm_rails_config.models if m.type == "main"), None
+        )
 
         engine = os.environ.get("MAIN_MODEL_ENGINE")
         if not engine and existing_main_model:
             engine = existing_main_model.engine
         elif not engine:
             engine = "openai"
-            log.warning("No main model in config and MAIN_MODEL_ENGINE not set, defaulting to 'openai'. ")
+            log.warning(
+                "No main model in config and MAIN_MODEL_ENGINE not set, defaulting to 'openai'. "
+            )
 
         parameters = {}
         base_url = os.environ.get("MAIN_MODEL_BASE_URL")
         if base_url:
             parameters["base_url"] = base_url
 
-        main_model = Model(model=model_name, type="main", engine=engine, parameters=parameters)
-        full_llm_rails_config = _update_models_in_config(full_llm_rails_config, main_model)
+        main_model = Model(
+            model=model_name, type="main", engine=engine, parameters=parameters
+        )
+        full_llm_rails_config = _update_models_in_config(
+            full_llm_rails_config, main_model
+        )
 
     llm_rails = LLMRails(config=full_llm_rails_config, verbose=True)
     llm_rails_instances[configs_cache_key] = llm_rails
 
     # If we have a cache for the events, we restore it
-    llm_rails.events_history_cache = llm_rails_events_history_cache.get(configs_cache_key, {})
+    llm_rails.events_history_cache = llm_rails_events_history_cache.get(
+        configs_cache_key, {}
+    )
 
     return llm_rails
 
@@ -443,7 +467,11 @@ def process_chunk(chunk: Any) -> Union[Any, ChunkError]:
         Union[Any, StreamingError]: StreamingError instance for errors or the original chunk.
     """
     # Convert chunk to string for JSON parsing if needed
-    chunk_str = chunk if isinstance(chunk, str) else json.dumps(chunk) if isinstance(chunk, dict) else str(chunk)
+    chunk_str = (
+        chunk
+        if isinstance(chunk, str)
+        else json.dumps(chunk) if isinstance(chunk, dict) else str(chunk)
+    )
 
     try:
         validated_data = ChunkError.model_validate_json(chunk_str)
@@ -476,7 +504,9 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
     """
     log.info("Got request for config %s", body.guardrails.config_id)
     for logger in registered_loggers:
-        asyncio.get_event_loop().create_task(logger({"endpoint": "/v1/chat/completions", "body": body.json()}))
+        asyncio.get_event_loop().create_task(
+            logger({"endpoint": "/v1/chat/completions", "body": body.json()})
+        )
 
     # Save the request headers in a context variable.
     api_request_headers.set(request.headers)
@@ -536,7 +566,10 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
 
         # Validate state format if provided
         if body.guardrails.state is not None and body.guardrails.state != {}:
-            if "events" not in body.guardrails.state and "state" not in body.guardrails.state:
+            if (
+                "events" not in body.guardrails.state
+                and "state" not in body.guardrails.state
+            ):
                 raise HTTPException(
                     status_code=422,
                     detail="Invalid state format: state must contain 'events' or 'state' key. Use an empty dict {} to start a new conversation.",
@@ -584,7 +617,11 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
 
             # If we're using threads, we also need to update the data before returning
             # the message.
-            if body.guardrails.thread_id and datastore is not None and datastore_key is not None:
+            if (
+                body.guardrails.thread_id
+                and datastore is not None
+                and datastore_key is not None
+            ):
                 await datastore.set(datastore_key, json.dumps(messages + [bot_message]))
 
             # Build the response with OpenAI-compatible format using utility function
@@ -646,14 +683,20 @@ class _ToolOutputCheckResult:
     log: _CheckLog
 
     @classmethod
-    def create(cls, activated_rails: List[ActivatedRail], blocked_message: Optional[str]):
+    def create(
+        cls, activated_rails: List[ActivatedRail], blocked_message: Optional[str]
+    ):
         """Create a tool output check result."""
-        response = [{"role": "assistant", "content": blocked_message}] if blocked_message else []
+        response = (
+            [{"role": "assistant", "content": blocked_message}]
+            if blocked_message
+            else []
+        )
         log = _CheckLog(activated_rails=activated_rails, stats=None)
         return cls(response=response, log=log)
 
 
-def _load_rails_for_check(
+async def _load_rails_for_check(
     config_id: Optional[str] = None,
     config_ids: Optional[List[str]] = None,
     config: Optional[dict] = None,
@@ -673,7 +716,7 @@ def _load_rails_for_check(
     if config:
         # Process inline config
         if isinstance(config, dict):
-            config = _process_inline_config(config, model_name)
+            config = await _process_inline_config(config, model_name)
 
         rails_config = (
             RailsConfig.from_content(yaml_content=config)
@@ -684,9 +727,9 @@ def _load_rails_for_check(
 
     # Use config_id(s) from server
     if config_ids:
-        return _get_rails(config_ids, model_name=model_name)
+        return await _get_rails(config_ids, model_name=model_name)
     if config_id:
-        return _get_rails([config_id], model_name=model_name)
+        return await _get_rails([config_id], model_name=model_name)
 
     raise ValueError("Either config, config_id, or config_ids must be provided")
 
@@ -736,10 +779,12 @@ def _validate_model_list(models: list) -> None:
     """
     for idx, model in enumerate(models):
         if not isinstance(model, dict):
-            raise ValueError(f"Invalid model at index {idx}: expected dict, got {type(model).__name__}")
+            raise ValueError(
+                f"Invalid model at index {idx}: expected dict, got {type(model).__name__}"
+            )
 
 
-def _inherit_models_from_server(server_config_id: str) -> list:
+async def _inherit_models_from_server(server_config_id: str) -> list:
     """Load and return models from server config.
 
     Args:
@@ -752,17 +797,21 @@ def _inherit_models_from_server(server_config_id: str) -> list:
         ValueError: If server config cannot be loaded or has no models
     """
     try:
-        default_rails = _get_rails([server_config_id])
+        default_rails = await _get_rails([server_config_id])
         if not default_rails.config.models:
-            raise ValueError(f"Server config '{server_config_id}' has no models defined")
+            raise ValueError(
+                f"Server config '{server_config_id}' has no models defined"
+            )
         return [_build_model_dict(model) for model in default_rails.config.models]
     except ValueError:
         raise
     except Exception as e:
-        raise ValueError(f"Could not inherit models from server config '{server_config_id}': {e}") from e
+        raise ValueError(
+            f"Could not inherit models from server config '{server_config_id}': {e}"
+        ) from e
 
 
-def _process_inline_config(config: dict, model_name: Optional[str]) -> dict:
+async def _process_inline_config(config: dict, model_name: Optional[str]) -> dict:
     """Process inline config to ensure it has valid models.
 
     Handles three scenarios:
@@ -784,7 +833,9 @@ def _process_inline_config(config: dict, model_name: Optional[str]) -> dict:
 
     # Validate models field type
     if models is not None and not isinstance(models, list):
-        raise ValueError(f"Invalid inline config: 'models' must be a list, got {type(models).__name__}")
+        raise ValueError(
+            f"Invalid inline config: 'models' must be a list, got {type(models).__name__}"
+        )
 
     models = models if models is not None else []
     server_config_id = app.default_config_id or app.single_config_id
@@ -795,7 +846,7 @@ def _process_inline_config(config: dict, model_name: Optional[str]) -> dict:
         _validate_model_list(config["models"])
     elif server_config_id:
         # Scenario 2: Inherit from server config
-        config["models"] = _inherit_models_from_server(server_config_id)
+        config["models"] = await _inherit_models_from_server(server_config_id)
         log.info(
             f"Inherited {len(config['models'])} model(s) from server config '{server_config_id}'"
             + (f", overriding main model with '{model_name}'" if model_name else "")
@@ -829,7 +880,9 @@ def _convert_tool_call_to_nemo_format(tool_call: dict) -> dict:
     return tool_call
 
 
-async def _check_tool_output_rails(llm_rails: LLMRails, tool_calls: list) -> _ToolOutputCheckResult:
+async def _check_tool_output_rails(
+    llm_rails: LLMRails, tool_calls: list
+) -> _ToolOutputCheckResult:
     """Check tool output rails and return a result object."""
     nemo_tool_calls = [_convert_tool_call_to_nemo_format(tc) for tc in tool_calls]
     events = [utils.new_event_dict("BotToolCalls", tool_calls=nemo_tool_calls)]
@@ -842,7 +895,11 @@ async def _check_tool_output_rails(llm_rails: LLMRails, tool_calls: list) -> _To
         if event.get("type") == "StartToolOutputRail" and event.get("flow_id")
     ]
     blocked_message = next(
-        (event.get("script") for event in result_events if event.get("type") == "StartUtteranceBotAction"),
+        (
+            event.get("script")
+            for event in result_events
+            if event.get("type") == "StartUtteranceBotAction"
+        ),
         None,
     )
 
@@ -876,12 +933,16 @@ def _get_config_ids_from_request(
     return None
 
 
-def _create_check_error_response(error: str, details: Optional[str] = None) -> GuardrailCheckResponse:
+def _create_check_error_response(
+    error: str, details: Optional[str] = None
+) -> GuardrailCheckResponse:
     """Create a standardized error response for guardrail checks."""
     guardrails_data = {"error": error}
     if details:
         guardrails_data["details"] = details
-    return GuardrailCheckResponse(status="error", rails_status={}, guardrails_data=guardrails_data)
+    return GuardrailCheckResponse(
+        status="error", rails_status={}, guardrails_data=guardrails_data
+    )
 
 
 def _create_check_options(
@@ -903,22 +964,33 @@ def _create_check_options(
             tool_input=run_tool_input,
             tool_output=run_tool_output,
         ),
-        log=GenerationLogOptions(activated_rails=True, internal_events=True, llm_calls=True),
+        log=GenerationLogOptions(
+            activated_rails=True, internal_events=True, llm_calls=True
+        ),
     )
 
 
 def _calculate_check_status(rails_status: dict[str, RailStatus]) -> str:
     """Calculate overall status from rails status dictionary."""
-    return "blocked" if any(s.status == "blocked" for s in rails_status.values()) else "success"
+    return (
+        "blocked"
+        if any(s.status == "blocked" for s in rails_status.values())
+        else "success"
+    )
 
 
-def _has_response_content(result: Union[GenerationResponse, _ToolOutputCheckResult]) -> bool:
+def _has_response_content(
+    result: Union[GenerationResponse, _ToolOutputCheckResult],
+) -> bool:
     """Check if result has a non-empty response."""
     return hasattr(result, "response") and bool(result.response)
 
 
 def _is_rail_blocked(
-    rail: ActivatedRail, role: str, msg: dict, result: Union[GenerationResponse, _ToolOutputCheckResult]
+    rail: ActivatedRail,
+    role: str,
+    msg: dict,
+    result: Union[GenerationResponse, _ToolOutputCheckResult],
 ) -> bool:
     """Determine if a rail blocked execution."""
     if getattr(rail, "stop", False):
@@ -992,7 +1064,9 @@ def _build_final_response(
     """Build final guardrail check response."""
     guardrails_data = {
         "log": {
-            "activated_rails": [rail.name for rail in aggregated_log.activated_rails if rail.stop],
+            "activated_rails": [
+                rail.name for rail in aggregated_log.activated_rails if rail.stop
+            ],
             "stats": aggregated_log.stats.model_dump() if aggregated_log.stats else {},
         }
     }
@@ -1012,7 +1086,10 @@ def _json_response(response: GuardrailCheckResponse) -> str:
 
 async def _process_message(
     llm_rails: LLMRails, msg: dict, role: str, content: str
-) -> tuple[Optional[Union[GenerationResponse, _ToolOutputCheckResult]], Optional[GenerationOptions]]:
+) -> tuple[
+    Optional[Union[GenerationResponse, _ToolOutputCheckResult]],
+    Optional[GenerationOptions],
+]:
     """Process a single message and return result and options.
 
     Returns:
@@ -1038,7 +1115,9 @@ async def _process_message(
         return None, _create_check_options(run_tool_input=True)
 
     # Unsupported role
-    raise ValueError(f"Unsupported message role: '{role}'. Supported roles are: 'user', 'assistant', 'tool'.")
+    raise ValueError(
+        f"Unsupported message role: '{role}'. Supported roles are: 'user', 'assistant', 'tool'."
+    )
 
 
 def _build_check_messages(role: str, content: str, msg: dict) -> List[dict]:
@@ -1070,7 +1149,9 @@ def _build_check_messages(role: str, content: str, msg: dict) -> List[dict]:
         return [tool_msg]
 
     # This should never be reached since _process_message validates the role first
-    raise ValueError(f"Unsupported message role: '{role}'. Supported roles are: 'user', 'assistant', 'tool'.")
+    raise ValueError(
+        f"Unsupported message role: '{role}'. Supported roles are: 'user', 'assistant', 'tool'."
+    )
 
 
 @app.post(
@@ -1116,13 +1197,17 @@ async def guardrail_checks(body: GuardrailsChatCompletionRequest, request: Reque
         try:
             # Validate messages
             if not body.messages:
-                yield _json_response(_create_check_error_response("Messages list cannot be empty."))
+                yield _json_response(
+                    _create_check_error_response("Messages list cannot be empty.")
+                )
                 return
 
             # Load rails configuration
             try:
                 if body.guardrails.config:
-                    llm_rails = _load_rails_for_check(config=body.guardrails.config, model_name=body.model)
+                    llm_rails = await _load_rails_for_check(
+                        config=body.guardrails.config, model_name=body.model
+                    )
                 else:
                     config_ids = _get_config_ids_from_request(body)
                     if not config_ids:
@@ -1132,7 +1217,9 @@ async def guardrail_checks(body: GuardrailsChatCompletionRequest, request: Reque
                             )
                         )
                         return
-                    llm_rails = _load_rails_for_check(config_ids=config_ids, model_name=body.model)
+                    llm_rails = await _load_rails_for_check(
+                        config_ids=config_ids, model_name=body.model
+                    )
             except Exception as e:
                 log.exception(e)
                 error_msg = (
@@ -1153,12 +1240,16 @@ async def guardrail_checks(body: GuardrailsChatCompletionRequest, request: Reque
             for msg_idx, msg in enumerate(body.messages):
                 # Pydantic validates messages is List[dict], but role might be missing or not a string
                 if "role" not in msg:
-                    log.warning(f"Skipping message at index {msg_idx}: missing 'role' field")
+                    log.warning(
+                        f"Skipping message at index {msg_idx}: missing 'role' field"
+                    )
                     continue
 
                 role = msg.get("role")
                 if not isinstance(role, str):
-                    log.warning(f"Skipping message at index {msg_idx}: 'role' is not a string")
+                    log.warning(
+                        f"Skipping message at index {msg_idx}: 'role' is not a string"
+                    )
                     continue
 
                 content = msg.get("content", "")
@@ -1170,25 +1261,35 @@ async def guardrail_checks(body: GuardrailsChatCompletionRequest, request: Reque
                 # If we got options, build messages and generate
                 if options:
                     check_messages = _build_check_messages(role, content, msg)
-                    gen_result = await llm_rails.generate_async(messages=check_messages, options=options)
+                    gen_result = await llm_rails.generate_async(
+                        messages=check_messages, options=options
+                    )
                     # generate_async returns GenerationResponse when options are provided
                     if isinstance(gen_result, GenerationResponse):
                         result = gen_result
                     else:
-                        log.warning(f"Unexpected result type from generate_async: {type(gen_result)}")
+                        log.warning(
+                            f"Unexpected result type from generate_async: {type(gen_result)}"
+                        )
                         continue
 
                 # result should always exist for supported roles
                 if not result:
-                    log.warning(f"No result generated for message {msg_idx} with role {role}")
+                    log.warning(
+                        f"No result generated for message {msg_idx} with role {role}"
+                    )
                     continue
 
                 # Process result and track activated rails
                 message_rails: dict[str, RailStatus] = {}
-                _process_result_log(result, role, msg, rails_status, message_rails, aggregated_log)
+                _process_result_log(
+                    result, role, msg, rails_status, message_rails, aggregated_log
+                )
 
                 # Add message result
-                message_results.append(MessageCheckResult(index=msg_idx, role=role, rails=message_rails))
+                message_results.append(
+                    MessageCheckResult(index=msg_idx, role=role, rails=message_rails)
+                )
 
                 # Stream intermediate results if requested
                 if body.stream:
@@ -1201,12 +1302,16 @@ async def guardrail_checks(body: GuardrailsChatCompletionRequest, request: Reque
                     yield _json_response(intermediate)
 
             # Build and yield final response
-            final_result = _build_final_response(rails_status, message_results, aggregated_log)
+            final_result = _build_final_response(
+                rails_status, message_results, aggregated_log
+            )
             yield _json_response(final_result)
 
         except Exception as e:
             log.exception(e)
-            yield _json_response(_create_check_error_response("Internal server error.", str(e)))
+            yield _json_response(
+                _create_check_error_response("Internal server error.", str(e))
+            )
 
     if body.stream:
         return StreamingResponse(process_checks(), media_type="application/x-ndjson")
@@ -1269,7 +1374,9 @@ def start_auto_reload_monitoring():
                     return None
 
                 elif event.event_type == "created" or event.event_type == "modified":
-                    log.info(f"Watchdog received {event.event_type} event for file {event.src_path}")
+                    log.info(
+                        f"Watchdog received {event.event_type} event for file {event.src_path}"
+                    )
 
                     # Compute the relative path
                     src_path_str = str(event.src_path)
@@ -1293,7 +1400,9 @@ def start_auto_reload_monitoring():
                                 # We save the events history cache, to restore it on the new instance
                                 llm_rails_events_history_cache[config_id] = val
 
-                            log.info(f"Configuration {config_id} has changed. Clearing cache.")
+                            log.info(
+                                f"Configuration {config_id} has changed. Clearing cache."
+                            )
 
         observer = Observer()
         event_handler = Handler()
@@ -1308,7 +1417,9 @@ def start_auto_reload_monitoring():
 
     except ImportError:
         # Since this is running in a separate thread, we just print the error.
-        print("The auto-reload feature requires `watchdog`. Please install using `pip install watchdog`.")
+        print(
+            "The auto-reload feature requires `watchdog`. Please install using `pip install watchdog`."
+        )
         # Force close everything.
         os._exit(-1)
 
